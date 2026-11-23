@@ -7,6 +7,46 @@ on:
     branches: [main]
   workflow_dispatch:
 
+concurrency:
+  group: mq-backend-kafka-test-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SBCL_VERSION: 2.6.7
+  ROSWELL_VERSION: "26.02.116"
+  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
 jobs:
+  # librdkafka is staged into lib/<os>-<arch>/ the way the overlays are,
+  # so the checkout loads it like an installed package loads native/.
+  # Live tests skip: no Kafka broker in CI.
   test:
-    uses: egao1980/cl-repository/.github/workflows/test-system.yml@main
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Stage librdkafka
+        shell: bash
+        run: ./scripts/fetch-librdkafka.sh
+
+      - uses: egao1980/cl-repository/.github/actions/setup-lisp@main
+        with:
+          sbcl-version: ${{ env.SBCL_VERSION }}
+          roswell-version: ${{ env.ROSWELL_VERSION }}
+
+      - uses: egao1980/cl-repository/.github/actions/ci@main
+        with:
+          phase: install
+          system: mq-backend-kafka
+
+      - uses: egao1980/cl-repository/.github/actions/ci@main
+        with:
+          phase: test
+          system: mq-backend-kafka
