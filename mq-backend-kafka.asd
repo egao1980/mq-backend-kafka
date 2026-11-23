@@ -11,11 +11,12 @@
   :in-order-to ((test-op (test-op "mq-backend-kafka/tests"))))
 
 (defsystem "mq-backend-kafka/tests"
-  :depends-on ("mq-backend-kafka" "rove")
+  :depends-on ("mq-backend-kafka" "rove" "cffi" "usocket")
   :pathname "tests"
   :serial t
   :components ((:file "package")
-               (:file "backend-test"))
+               (:file "backend-test")
+               (:file "driver-test"))
   :perform (test-op (o c)
              (unless (symbol-call :rove :run c)
                (error "tests failed for ~A" (component-name c)))))
