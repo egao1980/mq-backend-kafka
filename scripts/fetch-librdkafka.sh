@@ -53,7 +53,7 @@ sha256_of() {
 mkdir -p "$CACHE"
 if [[ ! -f "$PKG" ]]; then
   echo "==> download $URL"
-  curl -fsSL --retry 3 "$URL" -o "$PKG.part"
+  curl -fsSL --retry 5 --retry-delay 2 --retry-all-errors "$URL" -o "$PKG.part"
   mv "$PKG.part" "$PKG"
 fi
 if [[ -n "${RDKAFKA_SHA256:-}" ]]; then
