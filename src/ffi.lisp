@@ -99,6 +99,40 @@
   (rk :pointer) (partitions :pointer))
 (cffi:defcfun ("rd_kafka_consumer_close" %rd-consumer-close) :int (rk :pointer))
 
+;;; Consumer group rebalances: the driver's own rebalance callback assigns
+;;; and revokes, so it knows which partitions this member owns.
+(defconstant +rd-kafka-resp-err-revoke-partitions+ -174)
+
+(defconstant +rd-kafka-resp-err-assign-partitions+ -175)
+
+(defconstant +rd-kafka-offset-invalid+ -1001)
+
+(cffi:defcstruct rd-kafka-topic-partition-list
+  (cnt :int)
+  (size :int)
+  (elems :pointer))
+
+(cffi:defcfun ("rd_kafka_conf_set_rebalance_cb" %rd-conf-set-rebalance-cb) :void
+  (conf :pointer) (rebalance-cb :pointer))
+
+(cffi:defcfun ("rd_kafka_conf_set_opaque" %rd-conf-set-opaque) :void
+  (conf :pointer) (opaque :pointer))
+
+(cffi:defcfun ("rd_kafka_assign" %rd-assign) :int (rk :pointer) (partitions :pointer))
+
+(cffi:defcfun ("rd_kafka_incremental_assign" %rd-incremental-assign) :pointer
+  (rk :pointer) (partitions :pointer))
+
+(cffi:defcfun ("rd_kafka_incremental_unassign" %rd-incremental-unassign) :pointer
+  (rk :pointer) (partitions :pointer))
+
+(cffi:defcfun ("rd_kafka_rebalance_protocol" %rd-rebalance-protocol) :string (rk :pointer))
+
+(cffi:defcfun ("rd_kafka_assignment_lost" %rd-assignment-lost) :int (rk :pointer))
+
+(cffi:defcfun ("rd_kafka_committed" %rd-committed) :int
+  (rk :pointer) (partitions :pointer) (timeout-ms :int))
+
 (defun librdkafka-loaded-p ()
   "True when librdkafka's symbols resolve in this image."
   (and (cffi:foreign-symbol-pointer "rd_kafka_version") t))

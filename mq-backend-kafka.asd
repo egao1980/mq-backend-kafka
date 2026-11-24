@@ -1,5 +1,5 @@
 (defsystem "mq-backend-kafka"
-  :version "0.2.0"
+  :version "0.2.1"
   :description "Kafka backend for mq-protocol: librdkafka CFFI driver with consumer groups, ack = offset commit; librdkafka ships as native overlays"
   :author "egao1980"
   :license "MIT"
@@ -41,7 +41,9 @@
                (:file "topics-test")
                (:file "evidence-r2-test")
                (:file "settle-test")
-               (:file "evidence-r3-test"))
+               (:file "evidence-r3-test")
+               (:file "revoke-test")
+               (:file "threads-test"))
   :perform (test-op (o c)
-             (unless (symbol-call :rove :run c)
-               (error "tests failed for ~A" (component-name c)))))
+                    (unless (symbol-call :rove :run c)
+                      (error "tests failed for ~A" (component-name c)))))
