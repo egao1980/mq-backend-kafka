@@ -27,6 +27,15 @@
   (paused (make-hash-table :test 'equal))
   (next-tag 0)
   (redeliver (make-hash-table :test 'equal))
+  ;; (topic partition) → offsets settled (ACK, or NACK without requeue)
+  ;; that the group's commit has not passed yet. A seek or a rebalance that
+  ;; fetches one again skips it.
+  (settled (make-hash-table :test 'equal))
+  ;; (topic partition) → offsets NACKed with requeue and not fetched again
+  ;; yet: unsettled, so the commit does not pass them.
+  (requeued (make-hash-table :test 'equal))
+  ;; (topic partition) → the next offset this backend committed last.
+  (committed (make-hash-table :test 'equal))
   (lock (bt2:make-recursive-lock :name "rdkafka-session"))
   (closed nil))
 
@@ -303,8 +312,9 @@ the last one it returned."
 The consumer is subscribed to every topic polled so far, so a message of
 another topic can arrive: it is buffered for that topic, oldest first, and
 its partition paused until that topic is polled. A message this backend
-still holds (handed out and not settled, or buffered) is not handed out
-again when a rebalance or a seek fetches it a second time."
+still holds (handed out and not settled, or buffered), or has settled
+past the group's commit, is not handed out again when a rebalance or a
+seek fetches it a second time."
   (%ensure-subscribed session topic)
   (%resume-topic session topic)
   (let* ((rk (%consumer session))
@@ -329,11 +339,14 @@ again when a rebalance or a seek fetches it a second time."
                   (let ((meta (%rkmessage-meta rkmessage)))
                     (cond
                      ((gethash meta (%session-held session)))
-                     ((equal (first meta) topic)
-                      (push (%message session rkmessage meta) out))
+                     ((%settled-p session meta))
                      (t
-                      (%buffer session (first meta) (%message session rkmessage meta))
-                      (%pause-partition session (first meta) (second meta)))))))
+                      (%unrequeue session meta)
+                      (if (equal (first meta) topic)
+                          (push (%message session rkmessage meta) out)
+                          (progn
+                            (%buffer session (first meta) (%message session rkmessage meta))
+                            (%pause-partition session (first meta) (second meta)))))))))
             (%rd-message-destroy rkmessage))))
       (when (or (null timeout)
                 (>= (get-internal-real-time) deadline))
@@ -357,22 +370,83 @@ again when a rebalance or a seek fetches it a second time."
     (remhash meta (%session-held session))
     meta))
 
-(defun %commit (session topic partition offset)
-  "Commit OFFSET + 1 for TOPIC / PARTITION, synchronously."
-  (let ((list (%one-partition topic partition (1+ offset))))
+(defun %commit (session topic partition next)
+  "Commit NEXT (the offset the group resumes at) for TOPIC / PARTITION,
+synchronously."
+  (let ((list (%one-partition topic partition next)))
     (unwind-protect
-         (let ((rc (%rd-commit (%consumer session) list 0)))
-           (unless (zerop rc)
-             (%kafka-error "rd_kafka_commit ~a[~d]@~d: ~a" topic partition (1+ offset)
-                           (%rd-err2str rc))))
+        (let ((rc (%rd-commit (%consumer session) list 0)))
+          (unless (zerop rc)
+            (%kafka-error "rd_kafka_commit ~a[~d]@~d: ~a" topic partition next
+                          (%rd-err2str rc))))
       (%rd-tpl-destroy list))))
 
+(defun %settled-p (session meta)
+  "Has this backend settled the message at META (topic partition offset)
+past the group's commit? A seek or a rebalance can fetch it again."
+  (destructuring-bind (topic partition offset) meta
+    (and (member offset (gethash (list topic partition) (%session-settled session)))
+         t)))
+
+(defun %unrequeue (session meta)
+  "The message at META is fetched again: it is held from now on, no longer
+only requeued."
+  (destructuring-bind (topic partition offset) meta
+    (let ((key (list topic partition)))
+      (when (gethash key (%session-requeued session))
+        (setf (gethash key (%session-requeued session))
+              (remove offset (gethash key (%session-requeued session))))))))
+
+(defun %unsettled-offsets (session topic partition)
+  "Offsets of TOPIC / PARTITION this backend fetched and has not settled:
+held (handed out or buffered) or NACKed with requeue and not fetched again."
+  (let ((out (copy-list (gethash (list topic partition) (%session-requeued session)))))
+    (maphash (lambda (meta tag)
+               (declare (ignore tag))
+               (when (and (eql (second meta) partition) (equal (first meta) topic))
+                 (push (third meta) out)))
+             (%session-held session))
+    out))
+
+(defun %commit-target (settled unsettled committed)
+  "The offset to commit for one partition, or NIL for no commit. SETTLED:
+offsets settled and not committed past yet (non-empty); UNSETTLED: offsets
+fetched and not settled; COMMITTED: the offset last committed, or NIL.
+The target is the earliest unsettled offset, or one past the last settled
+offset when none is unsettled. It is committed only when it settles
+something new and moves forward."
+  (let ((target (if unsettled
+                    (reduce #'min unsettled)
+                    (1+ (reduce #'max settled)))))
+    (and (some (lambda (o) (< o target)) settled)
+         (or (null committed) (> target committed))
+         target)))
+
+(defun %settle (session topic partition offset)
+  "Settle the message at OFFSET of TOPIC / PARTITION and commit as far as
+the settled messages reach (%COMMIT-TARGET). A message settled while an
+earlier one is unsettled is committed once that one is settled; if this
+member leaves first, the group's next member gets both again (at least
+once). The commit never moves back."
+  (let* ((key (list topic partition))
+         (settled (cons offset (gethash key (%session-settled session))))
+         (target (%commit-target settled
+                                 (%unsettled-offsets session topic partition)
+                                 (gethash key (%session-committed session)))))
+    (setf (gethash key (%session-settled session)) settled)
+    (when target
+      (%commit session topic partition target)
+      (setf (gethash key (%session-committed session)) target
+            (gethash key (%session-settled session))
+            (remove-if (lambda (o) (< o target)) settled)))))
+
 (defun %ack (session message)
-  "Commit the message's offset: the group resumes after it. As in Kafka, this
-settles every earlier message of the same partition too."
+  "Settle the message (%SETTLE): the group's commit moves past it once
+every earlier message of its partition that this backend fetched is
+settled too, so acks in any order never move the commit back."
   (destructuring-bind (topic partition offset) (%take-inflight session message)
     (remhash (list topic partition offset) (%session-redeliver session))
-    (%commit session topic partition offset))
+    (%settle session topic partition offset))
   message)
 
 (defun %drop-buffered-after (session topic partition offset)
@@ -396,29 +470,36 @@ OFFSET fetches them again, after the message at OFFSET."
   "REQUEUE: seek the partition back to the message, so it is delivered
 again, marked redelivered, followed by the later messages of its partition
 that this backend has not handed out (buffered ones are dropped and fetched
-again, in order). Later messages still held are not repeated. Otherwise
-commit past it."
+again, in order). Later messages still held, or already settled, are not
+repeated. If an earlier message of the partition was requeued and not
+fetched again yet, the seek goes back to that one. Otherwise settle it
+like ACK (%SETTLE)."
   (destructuring-bind (topic partition offset) (%take-inflight session message)
     (if requeue
-        (progn
-          (%drop-buffered-after session topic partition offset)
+        (let* ((key (list topic partition))
+               (requeued (cons offset (gethash key (%session-requeued session))))
+               (seek-to (reduce #'min requeued)))
+          (setf (gethash key (%session-requeued session)) requeued)
+          (%drop-buffered-after session topic partition seek-to)
           (when (member partition (gethash topic (%session-paused session)))
             ;; Fetch from the seek position now; a message of a topic that
             ;; is not being polled is buffered and paused again.
             (%partitions-call session #'%rd-resume-partitions "resume" topic (list partition))
             (setf (gethash topic (%session-paused session))
                   (remove partition (gethash topic (%session-paused session)))))
-          (let ((list (%one-partition topic partition offset)))
+          (let ((list (%one-partition topic partition seek-to)))
             (unwind-protect
                 (let ((err (%rd-seek-partitions (%consumer session) list 5000)))
                   (unless (cffi:null-pointer-p err)
                     (let ((text (%rd-error-string err)))
                       (%rd-error-destroy err)
                       (%kafka-error "rd_kafka_seek_partitions ~a[~d]@~d: ~a"
-                                    topic partition offset text))))
+                                    topic partition seek-to text))))
               (%rd-tpl-destroy list)))
           (setf (gethash (list topic partition offset) (%session-redeliver session)) t))
-        (%commit session topic partition offset)))
+        (progn
+          (remhash (list topic partition offset) (%session-redeliver session))
+          (%settle session topic partition offset))))
   message)
 
 (defun %flush (session timeout)
