@@ -25,9 +25,9 @@
 |---|---|
 | `make-kafka-backend` | `:bootstrap-servers`, `:group-id` (default: a fresh group per backend), `:config` (alist of librdkafka properties, e.g. `("security.protocol" . "SASL_SSL")`), `:driver` (inject your own plist), `:cffi-library-path` (a librdkafka to load when the overlay's is missing). Nothing connects until first use. |
 | `publish dest msg` | Produce to topic `dest` (else the message's topic). Key and header values are UTF-8 when they are strings. Asynchronous, as in librdkafka; `kafka-flush` waits for delivery, `close` flushes. |
-| `poll-messages topic &key n timeout` | The consumer joins the group and subscribes to `topic` (a rebalance follows the first poll). Waits up to `timeout` seconds for `n` messages; without `timeout` it makes one 100 ms poll. A message carries key, payload, headers, topic and a delivery tag. |
+| `poll-messages topic &key n timeout` | Returns messages of `topic` only. The consumer joins the group and adds `topic` to its subscription (a rebalance follows). Waits up to `timeout` seconds for `n` messages; without `timeout` it makes one 100 ms poll. A message of another subscribed topic that arrives meanwhile is buffered for that topic and its partition paused until that topic is polled. A message the backend still holds (handed out and not settled) is never handed out twice, even when a rebalance fetches it again. A message carries key, payload, headers, topic and a delivery tag. |
 | `ack msg` | Commits the message's offset + 1 (synchronous). The group's next member resumes after it. As in Kafka, this also settles earlier messages of the same partition. |
-| `nack msg :requeue t` | Seeks the partition back to the message: it, and what followed it, comes again, marked `redelivered-p`. `:requeue nil` commits past it. |
+| `nack msg :requeue t` | Seeks the partition back to the message: it comes again, marked `redelivered-p`, then the later messages of its partition that were not handed out yet. Later messages still held are not repeated. `:requeue nil` commits past it. |
 | delivery | at-least-once: `enable.auto.commit` is off, so a message that was never acked is delivered again to the next consumer of the group. |
 | `close` | Leaves the group (`rd_kafka_consumer_close`), flushes up to 10 s (not with `:abort t`), destroys both handles. Later calls signal `mq-connection-error`. |
 

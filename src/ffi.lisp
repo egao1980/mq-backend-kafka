@@ -91,6 +91,12 @@
   (rk :pointer) (offsets :pointer) (async :int))
 (cffi:defcfun ("rd_kafka_seek_partitions" %rd-seek-partitions) :pointer
   (rk :pointer) (partitions :pointer) (timeout-ms :int))
+
+(cffi:defcfun ("rd_kafka_pause_partitions" %rd-pause-partitions) :int
+  (rk :pointer) (partitions :pointer))
+
+(cffi:defcfun ("rd_kafka_resume_partitions" %rd-resume-partitions) :int
+  (rk :pointer) (partitions :pointer))
 (cffi:defcfun ("rd_kafka_consumer_close" %rd-consumer-close) :int (rk :pointer))
 
 (defun librdkafka-loaded-p ()

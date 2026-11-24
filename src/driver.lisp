@@ -5,6 +5,9 @@
 ;;; consumer is a member of GROUP-ID, subscribes to the topics it is polled
 ;;; for, and commits offsets only on ACK (enable.auto.commit=false), so an
 ;;; unacknowledged message is delivered again to the group's next member.
+;;; POLL-MESSAGES returns the polled topic only: messages of other
+;;; subscribed topics are buffered per topic (their partition paused), and a
+;;; message the backend still holds is never handed out twice.
 
 (defstruct (rdkafka-session (:conc-name %session-))
   bootstrap
@@ -14,6 +17,14 @@
   consumer
   (topics '())
   (inflight (make-hash-table :test 'eql))
+  ;; (topic partition offset) → delivery tag of every message this backend
+  ;; holds: handed out and not settled, or buffered.
+  (held (make-hash-table :test 'equal))
+  ;; topic → messages of that topic fetched while another topic was
+  ;; polled, oldest first.
+  (buffered (make-hash-table :test 'equal))
+  ;; topic → partitions paused because their messages were buffered.
+  (paused (make-hash-table :test 'equal))
   (next-tag 0)
   (redeliver (make-hash-table :test 'equal))
   (lock (bt2:make-recursive-lock :name "rdkafka-session"))
@@ -226,48 +237,108 @@
                                       (%from-octets (%foreign-octets
                                                      value (cffi:mem-ref sizep :size)))))))))))))
 
-(defun %message (session rkmessage)
-  "An MQ-MESSAGE for a consumed rd_kafka_message_t; its delivery tag maps to
-(topic partition offset) for ACK / NACK."
-  (cffi:with-foreign-slots ((rkt partition payload len key key-len offset)
-                            rkmessage (:struct rd-kafka-message))
-    (let* ((topic (and (not (cffi:null-pointer-p rkt)) (%rd-topic-name rkt)))
-           (meta (list topic partition offset))
-           (tag (incf (%session-next-tag session))))
-      (setf (gethash tag (%session-inflight session)) meta)
+(defun %rkmessage-meta (rkmessage)
+  "(topic partition offset) of a consumed rd_kafka_message_t."
+  (cffi:with-foreign-slots ((rkt partition offset) rkmessage (:struct rd-kafka-message))
+    (list (and (not (cffi:null-pointer-p rkt)) (%rd-topic-name rkt)) partition offset)))
+
+(defun %message (session rkmessage meta)
+  "An MQ-MESSAGE for a consumed rd_kafka_message_t at META (topic partition
+offset); its delivery tag maps to META for ACK / NACK, and the session
+holds META until the message is settled."
+  (cffi:with-foreign-slots ((payload len key key-len) rkmessage (:struct rd-kafka-message))
+    (let ((tag (incf (%session-next-tag session))))
+      (setf (gethash tag (%session-inflight session)) meta
+            (gethash meta (%session-held session)) tag)
       (mq-protocol:make-mq-message
        :key (and (not (cffi:null-pointer-p key)) (plusp key-len)
                  (%from-octets (%foreign-octets key key-len)))
        :payload (if (cffi:null-pointer-p payload) #() (%foreign-octets payload len))
        :headers (%read-headers rkmessage)
        :delivery-tag tag
-       :topic topic
+       :topic (first meta)
        :redelivered-p (and (gethash meta (%session-redeliver session)) t)))))
 
+(defun %buffer (session topic message)
+  "Keep MESSAGE, fetched for another topic, until TOPIC is polled."
+  (setf (gethash topic (%session-buffered session))
+        (append (gethash topic (%session-buffered session)) (list message))))
+
+(defun %take-buffered (session topic n)
+  "Up to N buffered messages of TOPIC, oldest first, removed from the buffer."
+  (let* ((all (gethash topic (%session-buffered session)))
+         (k (min n (length all))))
+    (setf (gethash topic (%session-buffered session)) (nthcdr k all))
+    (subseq all 0 k)))
+
+(defun %partitions-call (session fn what topic partitions)
+  "Call FN (rd_kafka_pause/resume_partitions) on TOPIC's PARTITIONS."
+  (let ((list (%rd-tpl-new (length partitions))))
+    (unwind-protect
+        (progn
+          (dolist (p partitions) (%rd-tpl-add list topic p))
+          (let ((rc (funcall fn (%consumer session) list)))
+            (unless (zerop rc)
+              (%kafka-error "rd_kafka_~a_partitions ~a~a: ~a" what topic partitions
+                            (%rd-err2str rc)))))
+      (%rd-tpl-destroy list))))
+
+(defun %pause-partition (session topic partition)
+  "Stop fetching TOPIC / PARTITION while another topic is polled, so the
+buffer holds few of its messages. librdkafka resumes from the message after
+the last one it returned."
+  (unless (member partition (gethash topic (%session-paused session)))
+    (%partitions-call session #'%rd-pause-partitions "pause" topic (list partition))
+    (push partition (gethash topic (%session-paused session)))))
+
+(defun %resume-topic (session topic)
+  "Resume the partitions of TOPIC that %PAUSE-PARTITION paused."
+  (let ((partitions (gethash topic (%session-paused session))))
+    (when partitions
+      (%partitions-call session #'%rd-resume-partitions "resume" topic partitions)
+      (remhash topic (%session-paused session)))))
+
 (defun %poll (session topic &key (n 1) timeout)
-  "Up to N messages of TOPIC. TIMEOUT seconds (NIL: one 100 ms poll)."
+  "Up to N messages of TOPIC. TIMEOUT seconds (NIL: one 100 ms poll).
+The consumer is subscribed to every topic polled so far, so a message of
+another topic can arrive: it is buffered for that topic, oldest first, and
+its partition paused until that topic is polled. A message this backend
+still holds (handed out and not settled, or buffered) is not handed out
+again when a rebalance or a seek fetches it a second time."
   (%ensure-subscribed session topic)
+  (%resume-topic session topic)
   (let* ((rk (%consumer session))
          (deadline (+ (get-internal-real-time)
                       (round (* (or timeout 0) internal-time-units-per-second))))
-         (out '()))
+         ;; OUT is newest first until the final NREVERSE.
+         (out (reverse (%take-buffered session topic n))))
     (loop
+      (when (or (>= (length out) n)
+                (and out (null timeout)))
+        (return))
       (let* ((left (- deadline (get-internal-real-time)))
              (wait-ms (max 0 (min 200 (round (* 1000 left) internal-time-units-per-second))))
              (rkmessage (%rd-consumer-poll rk (if timeout wait-ms 100))))
         (unless (cffi:null-pointer-p rkmessage)
           (unwind-protect
-               (let ((err (cffi:foreign-slot-value rkmessage '(:struct rd-kafka-message) 'err)))
-                 ;; Non-zero ERR: a consumer event (rebalance in progress,
-                 ;; unknown topic before auto-create, ...) that librdkafka
-                 ;; retries by itself; it carries no message.
-                 (when (zerop err)
-                   (push (%message session rkmessage) out)))
+              (let ((err (cffi:foreign-slot-value rkmessage '(:struct rd-kafka-message) 'err)))
+                ;; Non-zero ERR: a consumer event (rebalance in progress,
+                ;; unknown topic before auto-create, ...) that librdkafka
+                ;; retries by itself; it carries no message.
+                (when (zerop err)
+                  (let ((meta (%rkmessage-meta rkmessage)))
+                    (cond
+                     ((gethash meta (%session-held session)))
+                     ((equal (first meta) topic)
+                      (push (%message session rkmessage meta) out))
+                     (t
+                      (%buffer session (first meta) (%message session rkmessage meta))
+                      (%pause-partition session (first meta) (second meta)))))))
             (%rd-message-destroy rkmessage))))
-      (when (or (>= (length out) n)
-                (null timeout)
+      (when (or (null timeout)
                 (>= (get-internal-real-time) deadline))
-        (return (nreverse out))))))
+        (return)))
+    (nreverse out)))
 
 (defun %one-partition (topic partition offset)
   (let* ((list (%rd-tpl-new 1))
@@ -276,11 +347,14 @@
     list))
 
 (defun %take-inflight (session message)
+  "Settle MESSAGE (or a delivery tag): the session no longer holds it.
+→ its (topic partition offset)."
   (let* ((tag (if (integerp message) message (mq-protocol:mq-message-delivery-tag message)))
          (meta (gethash tag (%session-inflight session))))
     (unless meta
       (%kafka-error "unknown or already settled delivery tag ~s" tag))
     (remhash tag (%session-inflight session))
+    (remhash meta (%session-held session))
     meta))
 
 (defun %commit (session topic partition offset)
@@ -301,20 +375,48 @@ settles every earlier message of the same partition too."
     (%commit session topic partition offset))
   message)
 
+(defun %drop-buffered-after (session topic partition offset)
+  "Forget the buffered messages of TOPIC / PARTITION past OFFSET: a seek to
+OFFSET fetches them again, after the message at OFFSET."
+  (flet ((later-p (m)
+           (destructuring-bind (tp p o)
+               (gethash (mq-protocol:mq-message-delivery-tag m) (%session-inflight session))
+             (and (equal tp topic) (eql p partition) (> o offset)))))
+    (let ((buffered (gethash topic (%session-buffered session))))
+      (dolist (m buffered)
+        (when (later-p m)
+          (%take-inflight session m)))
+      (setf (gethash topic (%session-buffered session))
+            (remove-if (lambda (m)
+                         (null (gethash (mq-protocol:mq-message-delivery-tag m)
+                                        (%session-inflight session))))
+                       buffered)))))
+
 (defun %nack (session message &key (requeue t))
-  "REQUEUE: seek the partition back to the message, so it (and what followed
-it) is delivered again, marked redelivered. Otherwise commit past it."
+  "REQUEUE: seek the partition back to the message, so it is delivered
+again, marked redelivered, followed by the later messages of its partition
+that this backend has not handed out (buffered ones are dropped and fetched
+again, in order). Later messages still held are not repeated. Otherwise
+commit past it."
   (destructuring-bind (topic partition offset) (%take-inflight session message)
     (if requeue
-        (let ((list (%one-partition topic partition offset)))
-          (unwind-protect
-               (let ((err (%rd-seek-partitions (%consumer session) list 5000)))
-                 (unless (cffi:null-pointer-p err)
-                   (let ((text (%rd-error-string err)))
-                     (%rd-error-destroy err)
-                     (%kafka-error "rd_kafka_seek_partitions ~a[~d]@~d: ~a"
-                                   topic partition offset text))))
-            (%rd-tpl-destroy list))
+        (progn
+          (%drop-buffered-after session topic partition offset)
+          (when (member partition (gethash topic (%session-paused session)))
+            ;; Fetch from the seek position now; a message of a topic that
+            ;; is not being polled is buffered and paused again.
+            (%partitions-call session #'%rd-resume-partitions "resume" topic (list partition))
+            (setf (gethash topic (%session-paused session))
+                  (remove partition (gethash topic (%session-paused session)))))
+          (let ((list (%one-partition topic partition offset)))
+            (unwind-protect
+                (let ((err (%rd-seek-partitions (%consumer session) list 5000)))
+                  (unless (cffi:null-pointer-p err)
+                    (let ((text (%rd-error-string err)))
+                      (%rd-error-destroy err)
+                      (%kafka-error "rd_kafka_seek_partitions ~a[~d]@~d: ~a"
+                                    topic partition offset text))))
+              (%rd-tpl-destroy list)))
           (setf (gethash (list topic partition offset) (%session-redeliver session)) t))
         (%commit session topic partition offset)))
   message)
