@@ -1,0 +1,7 @@
+mq-backend-kafka is MIT licensed (LICENSE).
+
+Its native overlays carry librdkafka (https://github.com/confluentinc/librdkafka),
+BSD 2-Clause, as released by Confluent in the librdkafka.redist package, with
+the libraries it links statically or ships beside it (OpenSSL, zlib, zstd, lz4,
+libcurl, cJSON, ...). Their licenses are in LICENSES.librdkafka.txt next to the
+library in every overlay.

@@ -4,3 +4,6 @@
 *~
 .DS_Store
 .cl-repository/
+build/
+lib/
+cl-repo.lock

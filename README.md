@@ -1,35 +1,50 @@
 # mq-backend-kafka
 
-[`mq-protocol`](https://github.com/egao1980/mq-protocol) backend skeleton for **Apache Kafka** via [librdkafka](https://github.com/confluentinc/librdkafka). Wave 1 ships the CLOS class and a **driver-injection** seam so tests never `dlopen` a missing `.so`.
+[`mq-protocol`](https://github.com/egao1980/mq-protocol) backend for **Apache Kafka** over [librdkafka](https://github.com/confluentinc/librdkafka), through CFFI. librdkafka ships with the package as native overlays and loads with the system: `(asdf:load-system "mq-backend-kafka")` is all a consumer does.
 
 ```lisp
 (asdf:load-system "mq-backend-kafka")
 
-(mq-backend-kafka:make-kafka-backend
- :bootstrap-servers "localhost:9092"
- :cffi-library-path nil)   ; reserved for the overlay path
-
-;; Without a driver, GFs signal MQ-ERROR "librdkafka not loaded"
-;; (restarts: USE-VALUE, RETRY). Tests inject a plist of functions:
-(let ((b (mq-backend-kafka:make-kafka-backend
-          :driver (list :publish (lambda (backend dest msg) msg)
-                        :poll (lambda (backend dest &key n timeout) nil)))))
-  (stack-mq:publish b "t" (stack-mq:make-mq-message :payload #(1))))
+;; confluent_kafka: Producer / Consumer({"bootstrap.servers": ..., "group.id": "workers"})
+(let ((b (mq-backend-kafka:make-kafka-backend :bootstrap-servers "localhost:9092"
+                                              :group-id "workers")))
+  (unwind-protect
+       (progn
+         (stack-mq:publish b "orders" (stack-mq:make-mq-message :key "customer-7"
+                                                                :payload "order-1"
+                                                                :headers '(("source" . "web"))))
+         (dolist (m (stack-mq:poll-messages b "orders" :n 10 :timeout 5))
+           (process m)
+           (stack-mq:ack b m)))          ; commits the offset
+    (close b)))                          ; flush, leave the group, free the handles
 ```
 
-Slots: `bootstrap-servers`, `cffi-library-path`, `driver`. **Do not** call `cffi:load-foreign-library` from this repo until the overlay exists — a missing library breaks CI.
+## Semantics
 
-## Native overlay (wave-1 follow-up)
+| | |
+|---|---|
+| `make-kafka-backend` | `:bootstrap-servers`, `:group-id` (default: a fresh group per backend), `:config` (alist of librdkafka properties, e.g. `("security.protocol" . "SASL_SSL")`), `:driver` (inject your own plist), `:cffi-library-path` (a librdkafka to load when the overlay's is missing). Nothing connects until first use. |
+| `publish dest msg` | Produce to topic `dest` (else the message's topic). Key and header values are UTF-8 when they are strings. Asynchronous, as in librdkafka; `kafka-flush` waits for delivery, `close` flushes. |
+| `poll-messages topic &key n timeout` | Returns messages of `topic` only. The consumer joins the group and adds `topic` to its subscription (a rebalance follows). Waits up to `timeout` seconds for `n` messages; without `timeout` it makes one 100 ms poll. A message of another subscribed topic that arrives meanwhile is buffered for that topic and its partition paused until that topic is polled. A message the backend still holds (handed out and not settled) is never handed out twice, even when a rebalance fetches it again. A message carries key, payload, headers, topic and a delivery tag. |
+| `ack msg` | Settles that message only, as in RabbitMQ and the in-memory backend, so a worker pool can ack in any order. The group's offset is committed (synchronously) up to the earliest message of the partition this backend fetched and has not settled, or past the last settled one when none is left, and it never moves back. A message acked while an earlier one is still out is committed once that one is settled; if the member leaves first, the next member of the group gets both again (at least once). |
+| `nack msg :requeue t` | Seeks the partition back to the message: it comes again, marked `redelivered-p`, then the later messages of its partition that were not handed out yet. Later messages still held, or already settled, are not repeated; two nacks in a row seek back to the earlier one. `:requeue nil` settles it like `ack`. |
+| delivery | at-least-once: `enable.auto.commit` is off, so a message that was never acked is delivered again to the next consumer of the group. |
+| `close` | Leaves the group (`rd_kafka_consumer_close`), flushes up to 10 s (not with `:abort t`), destroys both handles. Later calls signal `mq-connection-error`. |
 
-Same pattern as [`llama-cpp`](https://github.com/egao1980/llama-cpp) / `vllm-cpp`:
+`subscribe` (push) is not offered by the librdkafka driver: `mq-backend-capabilities` reports `subscribe-p nil`, and `subscribe` signals `mq-error` with the usual `use-value` / `retry` restarts. librdkafka errors (configuration, commit, seek) are `mq-error`s with librdkafka's text. Without librdkafka every operation signals `mq-error` "librdkafka not loaded".
 
-1. Publish natives from the **owning** repo with `publish-oci.yml` (`:cl-repo` overlays in the `.asd`: `:cffi-libraries ("rdkafka")`, per-platform `lib/<os>-<arch>/`).
-2. At ASDF load, **absolute-path** `cffi:load-foreign-library` of the staged `librdkafka` (probe overlay dir, `truename`, load that path). Push the dir onto `cffi:*foreign-library-directories*`. Never `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
-3. Consumers `(asdf:load-system "mq-backend-kafka")` — no `load-*` / `ensure-*` helper.
-4. Parity canary vs dockerized Redpanda.
+`librdkafka-version` / `librdkafka-loaded-p` report the loaded library.
 
-This checkout does **not** copy native binaries.
+## Native library
+
+The `(:native-library "rdkafka")` component ([asdf-native](https://github.com/egao1980/asdf-native)) loads, by absolute path: `$MQ_BACKEND_KAFKA_NATIVE`, then `native/` (the overlay of an installed package), then `lib/<os>-<arch>/` (a checkout), else the system librdkafka. On Windows the DLLs librdkafka.dll links are loaded first from the same directory. No `LD_LIBRARY_PATH` / `DYLD_LIBRARY_PATH`.
+
+Overlays: linux amd64 / arm64, darwin arm64, windows amd64. `scripts/fetch-librdkafka.sh [os-arch … | all]` stages them from librdkafka's release builds (the `librdkafka.redist` package Confluent publishes, pinned by version and SHA-256; **librdkafka 2.16.0**). On Linux and macOS the dependencies (OpenSSL, zlib, zstd, lz4, …) are linked statically; linux-amd64 uses the CentOS 8 build, which needs only glibc 2.28+. Licenses: `NOTICE`, and `LICENSES.librdkafka.txt` in each overlay. Publish: `.github/workflows/publish-oci.yml` (tag `v*` or dispatch).
+
+## Tests
+
+`cl-repo test` after `scripts/fetch-librdkafka.sh`. The live tests skip without a broker on `127.0.0.1:19094` (`MQ_KAFKA_TEST_BOOTSTRAP`); `tests/driver-test.lisp` has the `docker run` line for `apache/kafka-native:3.9.0`.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE) and [NOTICE](NOTICE).

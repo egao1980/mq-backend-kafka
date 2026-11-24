@@ -15,7 +15,7 @@
                  'mq-protocol:mq-error))))
 
 (deftest missing-driver-message
-  (let ((b (mq-backend-kafka:make-kafka-backend))
+  (let ((b (mq-backend-kafka:make-kafka-backend :cffi-library-path "/no/such/librdkafka.so"))
         (msg nil))
     (handler-case (mq-protocol:publish
                    b "t" (mq-protocol:make-mq-message :payload #(1)))
@@ -64,7 +64,7 @@
     (ok (eq :subscribed (mq-protocol:subscribe b "orders" #'identity)))))
 
 (deftest missing-driver-use-value
-  (let ((b (mq-backend-kafka:make-kafka-backend))
+  (let ((b (mq-backend-kafka:make-kafka-backend :cffi-library-path "/no/such/librdkafka.so"))
         (got :unset))
     (handler-bind ((mq-protocol:mq-error
                     (lambda (c)

@@ -5,6 +5,11 @@
            #:kafka-bootstrap-servers
            #:kafka-cffi-library-path
            #:kafka-driver
-           #:kafka-driver-loaded-p))
+           #:kafka-driver-loaded-p
+           #:kafka-group-id
+           #:kafka-flush
+           #:make-rdkafka-driver
+           #:librdkafka-loaded-p
+           #:librdkafka-version))
 
 (in-package #:mq-backend-kafka)

@@ -1,0 +1,63 @@
+# Stage librdkafka (release builds from the pinned librdkafka.redist package)
+# for every overlay platform, then publish source + overlays through the
+# reusable native workflow.
+name: Publish OCI Package
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Package version (input, else v* tag, else .asd :version)"
+        required: false
+        default: ""
+      registry:
+        description: "OCI registry (default: ghcr.io)"
+        required: false
+        default: "ghcr.io"
+
+jobs:
+  stage:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, arch: amd64 }
+          - { os: linux, arch: arm64 }
+          - { os: darwin, arch: arm64 }
+          - { os: windows, arch: amd64 }
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Stage librdkafka for ${{ matrix.os }}-${{ matrix.arch }}
+        shell: bash
+        run: |
+          ./scripts/fetch-librdkafka.sh "${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p native-bundle
+          cp -a "lib/${{ matrix.os }}-${{ matrix.arch }}/." native-bundle/
+
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-${{ matrix.os }}-${{ matrix.arch }}
+          path: native-bundle/
+
+  publish:
+    needs: stage
+    permissions:
+      contents: read
+      packages: write
+    uses: egao1980/cl-repository/.github/workflows/publish-native-package.yml@main
+    with:
+      package-name: mq-backend-kafka
+      version: ${{ inputs.version }}
+      registry: ${{ inputs.registry || 'ghcr.io' }}
+      source-paths: |
+        mq-backend-kafka.asd
+        src
+        LICENSE
+        README.md
+        NOTICE
+    secrets: inherit
