@@ -225,16 +225,17 @@ REBALANCE-OPAQUE (an integer), the consumer's rebalances go through
     props))
 
 (defun %producer (session)
-  (or (%session-producer session)
-      (bt2:with-lock-held ((%session-producer-lock session))
-        (or (%session-producer session)
-            (setf (%session-producer session)
-                  (%make-handle +rd-kafka-producer+
-                                (%properties session
-                                             '("client.id" . "cl-stack-mq-backend-kafka")
-                                             '("acks" . "all")
-                                             '("linger.ms" . "5")
-                                             '("allow.auto.create.topics" . "true"))))))))
+  "SESSION's producer handle, made on first use. Read under the producer
+lock too, so another thread never sees the handle before it is complete."
+  (bt2:with-lock-held ((%session-producer-lock session))
+    (or (%session-producer session)
+        (setf (%session-producer session)
+              (%make-handle +rd-kafka-producer+
+                            (%properties session
+                                         '("client.id" . "cl-stack-mq-backend-kafka")
+                                         '("acks" . "all")
+                                         '("linger.ms" . "5")
+                                         '("allow.auto.create.topics" . "true")))))))
 
 (defun %consumer (session)
   "SESSION's consumer handle, made on first use (under the session lock)."
@@ -957,7 +958,8 @@ was fetched signals KAFKA-PARTITION-REVOKED instead, with no lock held
   "Wait up to TIMEOUT seconds for queued messages to be delivered, in slices
 of at most 200 ms, so a CLOSE on another thread waits at most one slice.
 → T when the queue drained; NIL on timeout, or once the backend is closed."
-  (let ((rk (%session-producer session))
+  (let ((rk (bt2:with-lock-held ((%session-producer-lock session))
+              (%session-producer session)))
         (deadline (+ (get-internal-real-time)
                      (round (* timeout internal-time-units-per-second)))))
     (or (null rk)
