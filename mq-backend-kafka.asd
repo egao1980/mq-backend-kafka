@@ -1,5 +1,5 @@
 (defsystem "mq-backend-kafka"
-  :version "0.2.1"
+  :version "0.2.2"
   :description "Kafka backend for mq-protocol: librdkafka CFFI driver with consumer groups, ack = offset commit; librdkafka ships as native overlays"
   :author "egao1980"
   :license "MIT"

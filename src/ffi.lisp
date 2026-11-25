@@ -107,6 +107,19 @@
 
 (defconstant +rd-kafka-offset-invalid+ -1001)
 
+;;; Commit refusals: a rebalance is under way (retry once it is done), or
+;;; the group no longer knows this member (its assignment is lost).
+(defconstant +rd-kafka-resp-err-illegal-generation+ 22)
+
+(defconstant +rd-kafka-resp-err-unknown-member-id+ 25)
+
+(defconstant +rd-kafka-resp-err-rebalance-in-progress+ 27)
+
+(defconstant +rd-kafka-resp-err-fenced-instance-id+ 82)
+
+;;; A consumer event: max.poll.interval.ms ran out, librdkafka left the group.
+(defconstant +rd-kafka-resp-err-max-poll-exceeded+ -147)
+
 (cffi:defcstruct rd-kafka-topic-partition-list
   (cnt :int)
   (size :int)

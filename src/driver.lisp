@@ -48,7 +48,10 @@
   ;; (topic partition) → offsets NACKed with requeue and not fetched again
   ;; yet: unsettled, so the commit does not pass them.
   (requeued (make-hash-table :test 'equal))
-  ;; (topic partition) → the next offset this backend committed last.
+  ;; (topic partition) → the known commit: the group's committed offset
+  ;; when the partition was last assigned (rd_kafka_committed;
+  ;; RD_KAFKA_OFFSET_INVALID: none), moved by this member's own commits.
+  ;; No entry: unknown.
   (committed (make-hash-table :test 'equal))
   ;; (topic partition) → :OWNED (assigned to this member), or :PENDING
   ;; (revoked by an eager rebalance that may give it back). No entry: not
@@ -67,10 +70,16 @@
   (poll-lock (bt2:make-lock :name "rdkafka-poll"))
   ;; Making the producer handle.
   (producer-lock (bt2:make-lock :name "rdkafka-producer"))
-  ;; CLOSED and USERS, the calls inside %USING-HANDLES.
+  ;; CLOSED, USERS, USER-THREADS and DEFERRED-CLOSE: the calls inside
+  ;; %USING-HANDLES.
   (state-lock (bt2:make-lock :name "rdkafka-state"))
   (state-cv (bt2:make-condition-variable :name "rdkafka-state"))
   (users 0)
+  ;; thread → the number of its calls inside %USING-HANDLES.
+  (user-threads (make-hash-table :test 'eq))
+  ;; (:abort abort) when CLOSE ran on a thread inside a call: that
+  ;; thread's last %LEAVE releases the handles.
+  (deferred-close nil)
   (closed nil)
   ;; This session's key in *SESSIONS*: the rebalance callback's opaque.
   (id nil))
@@ -92,23 +101,36 @@ CONTINUE restart returns from ACK / NACK. librdkafka's offsets store refuses
 an unassigned partition the same way (Local: Erroneous state)."))
 
 (defun %enter (session)
-  "Count a call that uses SESSION's handles. Signals MQ-CONNECTION-ERROR
-when SESSION is closed."
+  "Count a call that uses SESSION's handles, per thread too. Signals
+MQ-CONNECTION-ERROR when SESSION is closed."
   (unless (bt2:with-lock-held ((%session-state-lock session))
             (unless (%session-closed session)
+              (incf (gethash (bt2:current-thread) (%session-user-threads session) 0))
               (incf (%session-users session))))
     (error 'mq-protocol:mq-connection-error :message "the Kafka backend is closed")))
 
 (defun %leave (session)
-  (bt2:with-lock-held ((%session-state-lock session))
-    (when (zerop (decf (%session-users session)))
-      (bt2:condition-broadcast (%session-state-cv session)))))
+  "End a call %ENTER counted. The last one of a thread that closed SESSION
+from inside a call releases the handles (%RELEASE-HANDLES)."
+  (let ((deferred
+          (bt2:with-lock-held ((%session-state-lock session))
+            (let ((threads (%session-user-threads session))
+                  (self (bt2:current-thread)))
+              (when (zerop (decf (gethash self threads)))
+                (remhash self threads))
+              (decf (%session-users session))
+              (bt2:condition-broadcast (%session-state-cv session))
+              (when (zerop (%session-users session))
+                (shiftf (%session-deferred-close session) nil))))))
+    (when deferred
+      (%release-handles session :abort (getf deferred :abort)))))
 
 (defmacro %using-handles ((session) &body body)
   "Run BODY as a call that uses SESSION's librdkafka handles: CLOSE destroys
-them only once no such call runs. Signals MQ-CONNECTION-ERROR when SESSION
-is closed. An MQ-ERROR from BODY is signalled again once BODY is done, so
-its handlers run with no lock held and may close the backend."
+them only once no such call runs, and a CLOSE from inside such a call (a
+handler of a condition BODY signals) leaves them to the call's end. Signals
+MQ-CONNECTION-ERROR when SESSION is closed. An MQ-ERROR from BODY is
+signalled again once BODY is done, so its handlers run with no lock held."
   (let ((s (gensym "SESSION"))
         (err (gensym "ERR"))
         (e (gensym "E"))
@@ -505,30 +527,45 @@ assignments, and polling TOPIC resumes it."
       (remhash key (%session-requeued session))
       (remhash key (%session-committed session)))))
 
+(defun %revoke-all-for-good (session)
+  "Every partition this member owns or has :PENDING left it for good
+(%REVOKE-FOR-GOOD): the group no longer knows this member, or a rebalance
+failed."
+  (dolist (key (loop for key being the hash-keys of (%session-ownership session)
+                     collect key))
+    (%revoke-for-good session (first key) (second key))))
+
 (defun %retained-p (session key group)
-  "Did nobody commit KEY (topic partition) since this member last did?
-GROUP: the group's committed offsets (%GROUP-COMMITTED)."
-  (let ((entry (assoc key group :test #'equal)))
-    (and entry
-         (eql (cdr entry)
-              (gethash key (%session-committed session) +rd-kafka-offset-invalid+)))))
+  "Is the group's commit of KEY (topic partition) unchanged since this
+member last knew it (the known commit: at the assignment, or this member's
+own commit since)? GROUP: the group's committed offsets now
+(%GROUP-COMMITTED). An unknown value on either side: not retained."
+  (let ((entry (assoc key group :test #'equal))
+        (known (gethash key (%session-committed session))))
+    (and entry known (eql (cdr entry) known))))
 
 (defun %on-assign (session rk keys)
-  "The group assigns KEYS ((topic partition) ...). A partition this member
-had until the eager revocation just before keeps its held messages when
-nobody committed it meanwhile (%RETAINED-P); every other :PENDING partition
-left for good. Then all of KEYS are :OWNED."
+  "The group assigns KEYS ((topic partition) ...). Ask the group for their
+commits (rd_kafka_committed). A partition this member had until the eager
+revocation just before keeps its held messages when the group's commit is
+the known one (%RETAINED-P); every other :PENDING partition left for good.
+Then all of KEYS are :OWNED, and the group's commit is their known commit
+(none when the group did not answer for one)."
   (let* ((ownership (%session-ownership session))
+         (known (%session-committed session))
          (pending (loop for key being the hash-keys of ownership using (hash-value state)
                         when (eq state :pending) collect key))
-         (back (intersection pending keys :test #'equal))
-         (group (and back (%group-committed rk back))))
+         (group (and keys (%group-committed rk keys))))
     (dolist (key pending)
-      (unless (and (member key back :test #'equal)
+      (unless (and (member key keys :test #'equal)
                    (%retained-p session key group))
         (%revoke-for-good session (first key) (second key))))
     (dolist (key keys)
-      (setf (gethash key ownership) :owned))))
+      (setf (gethash key ownership) :owned)
+      (let ((entry (assoc key group :test #'equal)))
+        (if entry
+            (setf (gethash key known) (cdr entry))
+            (remhash key known))))))
 
 (defun %apply-rebalance (rk err partitions cooperative)
   "Hand a rebalance back to librdkafka: assign or unassign PARTITIONS, the
@@ -558,12 +595,15 @@ rebalance failure, clears the assignment."
 rd_kafka_consumer_poll on the polling thread (which holds the poll lock,
 not the session lock) and inside rd_kafka_consumer_close. Under the session
 lock, so no commit runs meanwhile: record which partitions this member
-owns, then assign or revoke. An eager revocation marks its partitions
-:PENDING, and the assignment that follows decides (%ON-ASSIGN). A
-cooperative or lost revocation, or a rebalance failure, is for good
-(%REVOKE-FOR-GOOD). Partitions that come back get the commits settled while
-they were away. Nothing unwinds into librdkafka: an error is kept for the
-poll to signal, and librdkafka gets its assign call regardless."
+owns, then assign or revoke. An assignment learns the group's commits
+(%ON-ASSIGN) and commits what was settled on every owned partition before
+rd_kafka_assign / incremental_assign, so librdkafka fetches from past the
+acks. A revocation commits what was settled first (a commit refused during
+the rebalance is retried here). An eager revocation marks its partitions
+:PENDING, and the assignment that follows decides. A cooperative or lost
+revocation, or a rebalance failure, is for good (%REVOKE-FOR-GOOD). Nothing
+unwinds into librdkafka: an error is kept for the poll to signal, and
+librdkafka gets its assign call regardless."
   (let ((cooperative (equal (%rd-rebalance-protocol rk) "COOPERATIVE"))
         (applied nil))
     (flet ((apply-rebalance ()
@@ -578,25 +618,25 @@ poll to signal, and librdkafka gets its assign call regardless."
                                     (%partition-list partitions)))
                       (ownership (%session-ownership session)))
                   (cond
-                   ((= err +rd-kafka-resp-err-assign-partitions+)
-                    (%on-assign session rk keys)
-                    (apply-rebalance)
-                    (loop for (topic partition) in keys
-                          do (%commit-settled session topic partition)))
-                   ((and (= err +rd-kafka-resp-err-revoke-partitions+)
-                         (not cooperative)
-                         (zerop (%rd-assignment-lost rk)))
-                    (dolist (key keys)
-                      (when (gethash key ownership)
-                        (setf (gethash key ownership) :pending)))
-                    (apply-rebalance))
-                   (t
-                    (dolist (key (if (= err +rd-kafka-resp-err-revoke-partitions+)
-                                     keys
-                                     (loop for key being the hash-keys of ownership
-                                           collect key)))
-                      (%revoke-for-good session (first key) (second key)))
-                    (apply-rebalance))))))
+                    ((= err +rd-kafka-resp-err-assign-partitions+)
+                     (%on-assign session rk keys)
+                     (%commit-owned session)
+                     (apply-rebalance))
+                    ((and (= err +rd-kafka-resp-err-revoke-partitions+)
+                          (zerop (%rd-assignment-lost rk)))
+                     (%commit-owned session)
+                     (dolist (key keys)
+                       (cond
+                         (cooperative (%revoke-for-good session (first key) (second key)))
+                         ((gethash key ownership) (setf (gethash key ownership) :pending))))
+                     (apply-rebalance))
+                    ((= err +rd-kafka-resp-err-revoke-partitions+)
+                     (dolist (key keys)
+                       (%revoke-for-good session (first key) (second key)))
+                     (apply-rebalance))
+                    (t
+                     (%revoke-all-for-good session)
+                     (apply-rebalance))))))
         (error (e)
           (when session
             (bt2:with-recursive-lock-held ((%session-lock session))
@@ -616,31 +656,42 @@ poll to signal, and librdkafka gets its assign call regardless."
 (defun %take-in (session topic rkmessage)
   "Register a consumed RKMESSAGE, under the session lock. → its new
 MQ-MESSAGE when it is of TOPIC. NIL for a consumer event, a message this
-backend holds or has settled, one of a partition this member does not own
-(fetched before a revocation took effect), or one of another topic: that
-one is buffered for its topic, and its partition paused unless a thread
-polls that topic."
+backend holds or has settled, one below the partition's known commit (a
+fetch that started before this member's own commit), one of a partition
+this member does not own (fetched before a revocation took effect), or one
+of another topic: that one is buffered for its topic, and its partition
+paused unless a thread polls that topic. The consumer event
+MAX_POLL_EXCEEDED (librdkafka left the group for this member) revokes
+every partition for good."
   ;; Non-zero ERR: a consumer event (rebalance in progress, unknown topic
   ;; before auto-create, ...) that librdkafka retries by itself; it carries
   ;; no message.
-  (when (zerop (cffi:foreign-slot-value rkmessage '(:struct rd-kafka-message) 'err))
-    (let* ((meta (%rkmessage-meta rkmessage))
-           (of (first meta)))
-      (cond
-       ((gethash meta (%session-held session)) nil)
-       ((%settled-p session meta) nil)
-       ((not (eq (gethash (list of (second meta)) (%session-ownership session)) :owned))
-        nil)
-       (t
-        (%unrequeue session meta)
-        (let ((message (%message session rkmessage meta)))
-          (cond
-           ((equal of topic) message)
+  (let ((err (cffi:foreign-slot-value rkmessage '(:struct rd-kafka-message) 'err)))
+    (cond
+      ((= err +rd-kafka-resp-err-max-poll-exceeded+)
+       (%revoke-all-for-good session)
+       nil)
+      ((zerop err)
+       (let* ((meta (%rkmessage-meta rkmessage))
+              (of (first meta))
+              (key (list of (second meta))))
+         (cond
+           ((gethash meta (%session-held session)) nil)
+           ((%settled-p session meta) nil)
+           ((not (eq (gethash key (%session-ownership session)) :owned))
+            nil)
+           ((< (third meta) (gethash key (%session-committed session) -1))
+            nil)
            (t
-            (%buffer session of message)
-            (unless (plusp (gethash of (%session-polling session) 0))
-              (%pause-partition session of (second meta)))
-            nil))))))))
+            (%unrequeue session meta)
+            (let ((message (%message session rkmessage meta)))
+              (cond
+                ((equal of topic) message)
+                (t
+                 (%buffer session of message)
+                 (unless (plusp (gethash of (%session-polling session) 0))
+                   (%pause-partition session of (second meta)))
+                 nil))))))))))
 
 (defun %fetch-one (session topic wait-ms)
   "One rd_kafka_consumer_poll of up to WAIT-MS ms, holding the poll lock
@@ -765,13 +816,9 @@ inflight entry (topic partition offset epoch)."
 
 (defun %commit (session topic partition next)
   "Commit NEXT (the offset the group resumes at) for TOPIC / PARTITION,
-synchronously."
+synchronously. → librdkafka's error code: 0 when committed."
   (let ((list (%one-partition topic partition next)))
-    (unwind-protect
-        (let ((rc (%rd-commit (%consumer session) list 0)))
-          (unless (zerop rc)
-            (%kafka-error "rd_kafka_commit ~a[~d]@~d: ~a" topic partition next
-                          (%rd-err2str rc))))
+    (unwind-protect (%rd-commit (%consumer session) list 0)
       (%rd-tpl-destroy list))))
 
 (defun %settled-p (session meta)
@@ -815,53 +862,116 @@ something new and moves forward."
          (or (null committed) (> target committed))
          target)))
 
+(defun %known-commit (session key)
+  "KEY's known commit as an offset, or NIL: none, or unknown."
+  (let ((known (gethash key (%session-committed session))))
+    (and known (>= known 0) known)))
+
+(defun %assignment-lost-code-p (rc)
+  "Does a commit refused with RC mean the group no longer knows this
+member?"
+  (or (= rc +rd-kafka-resp-err-unknown-member-id+)
+      (= rc +rd-kafka-resp-err-fenced-instance-id+)))
+
+(defun %rebalance-refusal-p (rc)
+  "Was a commit refused with RC only because a rebalance is under way?"
+  (or (= rc +rd-kafka-resp-err-rebalance-in-progress+)
+      (= rc +rd-kafka-resp-err-illegal-generation+)))
+
 (defun %commit-settled (session topic partition)
   "Commit TOPIC / PARTITION as far as its settled messages reach
-(%COMMIT-TARGET), if this member owns it. → the offset committed, or NIL."
+(%COMMIT-TARGET), if this member owns it. → the offset committed (NIL:
+none), and the error code of a commit librdkafka refused (NIL: none).
+Committed: the target is the known commit, the settled offsets below it
+are dropped. Refused because a rebalance is under way
+(REBALANCE_IN_PROGRESS, ILLEGAL_GENERATION): the offsets stay settled, and
+the next commit of the partition (an ack, or the rebalance callback) takes
+them. Refused because the group no longer knows this member
+(UNKNOWN_MEMBER_ID, FENCED_INSTANCE_ID): the assignment is lost, every
+partition is revoked for good."
   (let* ((key (list topic partition))
          (settled (gethash key (%session-settled session))))
     (when (and settled (eq (gethash key (%session-ownership session)) :owned))
       (let ((target (%commit-target settled
                                     (%unsettled-offsets session topic partition)
-                                    (gethash key (%session-committed session)))))
+                                    (%known-commit session key))))
         (when target
-          (%commit session topic partition target)
-          (setf (gethash key (%session-committed session)) target
-                (gethash key (%session-settled session))
-                (remove-if (lambda (o) (< o target)) settled))
-          target)))))
+          (let ((rc (%commit session topic partition target)))
+            (cond
+              ((zerop rc)
+               (setf (gethash key (%session-committed session)) target
+                     (gethash key (%session-settled session))
+                     (remove-if (lambda (o) (< o target)) settled))
+               target)
+              ((%assignment-lost-code-p rc)
+               (%revoke-all-for-good session)
+               (values nil rc))
+              (t (values nil rc)))))))))
 
-(defun %settle (session topic partition offset)
-  "Settle the message at OFFSET of TOPIC / PARTITION and commit as far as
-the settled messages reach (%COMMIT-SETTLED). A message settled while an
+(defun %commit-owned (session)
+  "%COMMIT-SETTLED on every partition this member owns (the rebalance
+callback: a commit refused during the rebalance is retried here)."
+  (dolist (key (loop for key being the hash-keys of (%session-ownership session)
+                       using (hash-value state)
+                     when (eq state :owned) collect key))
+    (%commit-settled session (first key) (second key))))
+
+(defun %settle (session tag entry)
+  "Settle the message of delivery TAG, whose inflight ENTRY (topic
+partition offset epoch) %TAKE-INFLIGHT took, and commit as far as the
+settled messages reach (%COMMIT-SETTLED). A message settled while an
 earlier one is unsettled is committed once that one is settled; if this
 member leaves first, the group's next member gets both again (at least
 once). The commit never moves back. While an eager rebalance has the
-partition revoked (:PENDING), the commit waits for the assignment that
-gives it back."
-  (push offset (gethash (list topic partition) (%session-settled session)))
-  (%commit-settled session topic partition))
+partition revoked (:PENDING), or a commit is refused because a rebalance
+is under way, the commit waits for the rebalance callback or the next ack.
+→ NIL when settled, else what to signal once no lock is held:
+(:REVOKED entry) when the commit found the assignment lost (the tag stays,
+so acking it again says so too), or (:FAILED entry text) when librdkafka
+refused the commit otherwise: the settle is undone and the tag restored,
+so the caller may retry."
+  (destructuring-bind (topic partition offset epoch) entry
+    (declare (ignore epoch))
+    (let* ((key (list topic partition))
+           (meta (list topic partition offset))
+           (redeliver (gethash meta (%session-redeliver session))))
+      (remhash meta (%session-redeliver session))
+      (push offset (gethash key (%session-settled session)))
+      (multiple-value-bind (target rc) (%commit-settled session topic partition)
+        (declare (ignore target))
+        (cond
+          ((or (null rc) (%rebalance-refusal-p rc)) nil)
+          ((%assignment-lost-code-p rc)
+           (setf (gethash tag (%session-inflight session)) entry)
+           (list :revoked entry))
+          (t
+           (setf (gethash key (%session-settled session))
+                 (remove offset (gethash key (%session-settled session)) :count 1)
+                 (gethash tag (%session-inflight session)) entry
+                 (gethash meta (%session-held session)) tag)
+           (when redeliver
+             (setf (gethash meta (%session-redeliver session)) t))
+           (list :failed entry (format nil "rd_kafka_commit ~a[~d]: ~a"
+                                       topic partition (%rd-err2str rc)))))))))
 
 (defun %ack (session message)
   "Settle the message (%SETTLE): the group's commit moves past it once
 every earlier message of its partition that this backend fetched is
 settled too, so acks in any order never move the commit back. A message
-whose partition was revoked from this member since it was fetched is not
+whose partition was revoked from this member since it was fetched, or
+whose commit finds that the group no longer knows this member, is not
 settled and commits nothing: KAFKA-PARTITION-REVOKED, signalled with no
-lock held (CONTINUE returns)."
-  (let ((revoked (%using-handles (session)
-                   (bt2:with-recursive-lock-held ((%session-lock session))
-                     (let ((entry (%take-inflight session message)))
-                       (if (%revoked-entry-p session entry)
-                           entry
-                           (destructuring-bind (topic partition offset epoch) entry
-                             (declare (ignore epoch))
-                             (remhash (list topic partition offset) (%session-redeliver session))
-                             (%settle session topic partition offset)
-                             nil)))))))
-    (when revoked
-      (%signal-revoked revoked))
-    message))
+lock held (CONTINUE returns). A commit librdkafka refuses otherwise
+signals MQ-ERROR with the message still unsettled, so ACK may be retried."
+  (%signal-outcome
+   (%using-handles (session)
+     (bt2:with-recursive-lock-held ((%session-lock session))
+       (let* ((tag (%delivery-tag message))
+              (entry (%take-inflight session tag)))
+         (if (%revoked-entry-p session entry)
+             (list :revoked entry)
+             (%settle session tag entry))))))
+  message)
 
 (defun %drop-buffered-after (session topic partition offset)
   "Forget the buffered messages of TOPIC / PARTITION past OFFSET: a seek to
@@ -930,29 +1040,38 @@ CONTINUE returns NIL."
         :report "Return without settling the message."
         nil))))
 
+(defun %delivery-tag (message)
+  "MESSAGE's delivery tag (MESSAGE may be the tag itself)."
+  (if (integerp message) message (mq-protocol:mq-message-delivery-tag message)))
+
+(defun %signal-outcome (outcome)
+  "Signal what %SETTLE (or a revoked entry) left for ACK / NACK to signal
+once no lock is held: (:REVOKED entry) → KAFKA-PARTITION-REVOKED (CONTINUE
+returns NIL); (:FAILED entry text) → MQ-ERROR. NIL: nothing."
+  (case (first outcome)
+    (:revoked (%signal-revoked (second outcome)))
+    (:failed (%kafka-error "~a" (third outcome)))))
+
 (defun %nack (session message &key (requeue t))
   "REQUEUE: seek the partition back to the message (%REQUEUE), so it is
 delivered again, marked redelivered. Otherwise settle it like ACK
 (%SETTLE). A message whose partition was revoked from this member since it
 was fetched signals KAFKA-PARTITION-REVOKED instead, with no lock held
 (CONTINUE returns): the partition's new owner delivers it."
-  (let ((revoked (%using-handles (session)
-                   (bt2:with-recursive-lock-held ((%session-lock session))
-                     (let ((entry (%take-inflight session message)))
-                       (if (%revoked-entry-p session entry)
-                           entry
-                           (destructuring-bind (topic partition offset epoch) entry
-                             (declare (ignore epoch))
-                             (if requeue
-                                 (%requeue session topic partition offset)
-                                 (progn
-                                   (remhash (list topic partition offset)
-                                            (%session-redeliver session))
-                                   (%settle session topic partition offset)))
-                             nil)))))))
-    (when revoked
-      (%signal-revoked revoked))
-    message))
+  (%signal-outcome
+   (%using-handles (session)
+     (bt2:with-recursive-lock-held ((%session-lock session))
+       (let* ((tag (%delivery-tag message))
+              (entry (%take-inflight session tag)))
+         (cond
+           ((%revoked-entry-p session entry) (list :revoked entry))
+           (requeue
+            (destructuring-bind (topic partition offset epoch) entry
+              (declare (ignore epoch))
+              (%requeue session topic partition offset))
+            nil)
+           (t (%settle session tag entry)))))))
+  message)
 
 (defun %flush (session timeout)
   "Wait up to TIMEOUT seconds for queued messages to be delivered, in slices
@@ -971,33 +1090,51 @@ of at most 200 ms, so a CLOSE on another thread waits at most one slice.
             (when (or (zerop left-ms) (%session-closed session))
               (return nil)))))))
 
+(defun %release-handles (session &key abort)
+  "Leave the group, flush (unless ABORT) and destroy SESSION's handles,
+once it is closed and no other call uses them. → T when there were handles
+to release."
+  (let ((consumer (%session-consumer session))
+        (producer (%session-producer session)))
+    (setf (%session-producer session) nil)
+    (unwind-protect
+        (when consumer
+          ;; Leaves the group; the last revocation runs %ON-REBALANCE here,
+          ;; and its commits use the consumer handle, still in its slot.
+          (unwind-protect (%rd-consumer-close consumer)
+            (setf (%session-consumer session) nil))
+          (%rd-destroy consumer))
+      (%forget-session session)
+      (when producer
+        (unless abort (%rd-flush producer 10000))
+        (%rd-destroy producer)))
+    (and (or consumer producer) t)))
+
 (defun %close-session (session &key abort)
-  "Close SESSION once no call uses its handles (%USING-HANDLES: a poll
-stops at its next slice, a flush within 200 ms), then leave the group,
-flush (unless ABORT) and destroy both handles. Calls from then on signal
-MQ-CONNECTION-ERROR. → T when there were handles to release; NIL when
-there were none, or SESSION was closed already."
-  (when (bt2:with-lock-held ((%session-state-lock session))
-          (unless (%session-closed session)
-            (setf (%session-closed session) t)
-            (loop while (plusp (%session-users session))
-                  do (bt2:condition-wait (%session-state-cv session)
-                                         (%session-state-lock session)))
-            t))
-    (let ((consumer (%session-consumer session))
-          (producer (%session-producer session)))
-      (setf (%session-consumer session) nil
-            (%session-producer session) nil)
-      (unwind-protect
-          (when consumer
-            ;; Leaves the group; the last revocation runs %ON-REBALANCE here.
-            (%rd-consumer-close consumer)
-            (%rd-destroy consumer))
-        (%forget-session session)
-        (when producer
-          (unless abort (%rd-flush producer 10000))
-          (%rd-destroy producer)))
-      (and (or consumer producer) t))))
+  "Close SESSION once no call on another thread uses its handles
+(%USING-HANDLES: a poll stops at its next slice, a flush within 200 ms),
+then release them (%RELEASE-HANDLES). Called on a thread that is itself
+inside a call (from a handler of a condition the call signals), it does
+not wait for that call: the call's end releases the handles. Calls from
+then on signal MQ-CONNECTION-ERROR. → T when there were handles to
+release; NIL when there were none, or SESSION was closed already."
+  (let ((now
+          (bt2:with-lock-held ((%session-state-lock session))
+            (unless (%session-closed session)
+              (setf (%session-closed session) t)
+              (let ((self (bt2:current-thread)))
+                (flet ((own () (gethash self (%session-user-threads session) 0)))
+                  (loop while (> (%session-users session) (own))
+                        do (bt2:condition-wait (%session-state-cv session)
+                                               (%session-state-lock session)))
+                  (cond
+                    ((zerop (own)) :now)
+                    (t (setf (%session-deferred-close session) (list :abort abort))
+                       :deferred))))))))
+    (case now
+      (:now (%release-handles session :abort abort))
+      (:deferred (and (or (%session-consumer session) (%session-producer session)) t))
+      (t nil))))
 
 (defun %topic-name (destination)
   (etypecase destination
