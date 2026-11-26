@@ -87,3 +87,37 @@
       (close b)
       (let ((next (%next-member-gets topic group)))
         (ok (null next) (format nil "every ack was committed: nothing again (got ~S)" next))))))
+
+(deftest close-from-a-handler-inside-a-call-does-not-wait-for-itself
+  ;; A condition signalled inside a driver call (here a TYPE-ERROR from a
+  ;; header name that is not a string designator, inside PUBLISH) runs
+  ;; the caller's HANDLER-BIND handlers while the call still counts as a
+  ;; user of the handles. CLOSE there must not wait for its own thread:
+  ;; the handles are released when the call ends. No broker needed.
+  (let* ((b (%backend :bootstrap-servers (%bootstrap) :group-id (%name "chg")))
+         (result :running)
+         (worker
+           (bt2:make-thread
+            (lambda ()
+              (setf result
+                    (block call
+                      (handler-bind ((type-error
+                                       (lambda (e)
+                                         (declare (ignore e))
+                                         (return-from call (list :closed (close b))))))
+                        (mq-protocol:publish b (%name "cht")
+                                             (mq-protocol:make-mq-message
+                                              :payload "x" :headers '((42 . "v"))))
+                        :published))))
+            :name "close in handler")))
+    (loop repeat 100 while (bt2:thread-alive-p worker) do (sleep 0.1))
+    (ok (not (bt2:thread-alive-p worker))
+        "close inside the handler returned: it did not wait for its own call")
+    (unless (bt2:thread-alive-p worker)
+      (ok (equal '(:closed t) result)
+          (format nil "close released the producer once the call ended (got ~S)" result))
+      (ok (eq :closed (handler-case (progn (mq-protocol:publish
+                                            b "t" (mq-protocol:make-mq-message :payload "y"))
+                                      :published)
+                        (mq-protocol:mq-connection-error () :closed)))
+          "a later publish signals mq-connection-error"))))
