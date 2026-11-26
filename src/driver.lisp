@@ -53,6 +53,10 @@
   ;; RD_KAFKA_OFFSET_INVALID: none), moved by this member's own commits.
   ;; No entry: unknown.
   (committed (make-hash-table :test 'equal))
+  ;; (topic partition) → the offset this member's own commit moved the
+  ;; partition to since it was last assigned. A fetch that started before
+  ;; that commit returns messages below it again: they are dropped.
+  (own-commits (make-hash-table :test 'equal))
   ;; (topic partition) → :OWNED (assigned to this member), or :PENDING
   ;; (revoked by an eager rebalance that may give it back). No entry: not
   ;; this member's. Commits go only to :OWNED partitions.
@@ -110,8 +114,8 @@ MQ-CONNECTION-ERROR when SESSION is closed."
     (error 'mq-protocol:mq-connection-error :message "the Kafka backend is closed")))
 
 (defun %leave (session)
-  "End a call %ENTER counted. The last one of a thread that closed SESSION
-from inside a call releases the handles (%RELEASE-HANDLES)."
+  "End a call %ENTER counted. When CLOSE ran inside a call, the last call
+to end, on whichever thread, releases the handles (%RELEASE-HANDLES)."
   (let ((deferred
           (bt2:with-lock-held ((%session-state-lock session))
             (let ((threads (%session-user-threads session))
@@ -379,6 +383,9 @@ lock too, so another thread never sees the handle before it is complete."
 ;;; --- consume ---------------------------------------------------------------
 
 (defun %read-headers (rkmessage)
+  "The headers of RKMESSAGE as an alist. Names and values are UTF-8
+strings, or octets when they are not UTF-8 (another producer may send any
+bytes), so a header never fails the poll."
   (cffi:with-foreign-object (hdrsp :pointer)
     (setf (cffi:mem-ref hdrsp :pointer) (cffi:null-pointer))
     (when (zerop (%rd-message-headers rkmessage hdrsp))
@@ -388,9 +395,12 @@ lock too, so another thread never sees the handle before it is complete."
                 collect (cffi:with-foreign-objects ((namep :pointer) (valuep :pointer)
                                                     (sizep :size))
                           (%rd-header-get-all hdrs i namep valuep sizep)
-                          (let ((value (cffi:mem-ref valuep :pointer)))
-                            (cons (cffi:foreign-string-to-lisp (cffi:mem-ref namep :pointer)
-                                                               :encoding :utf-8)
+                          (let ((name (cffi:mem-ref namep :pointer))
+                                (value (cffi:mem-ref valuep :pointer)))
+                            (cons (%from-octets
+                                   (%foreign-octets name (loop for n from 0
+                                                               until (zerop (cffi:mem-aref name :uint8 n))
+                                                               finally (return n))))
                                   (if (cffi:null-pointer-p value)
                                       nil
                                       (%from-octets (%foreign-octets
@@ -404,20 +414,22 @@ lock too, so another thread never sees the handle before it is complete."
 (defun %message (session rkmessage meta)
   "An MQ-MESSAGE for a consumed rd_kafka_message_t at META (topic partition
 offset); its delivery tag maps to META and the partition's assignment epoch
-for ACK / NACK, and the session holds META until the message is settled."
+for ACK / NACK, and the session holds META until the message is settled.
+The message is read first: the tag is registered only once it is built."
   (cffi:with-foreign-slots ((payload len key key-len) rkmessage (:struct rd-kafka-message))
-    (let ((tag (incf (%session-next-tag session))))
-      (setf (gethash tag (%session-inflight session))
+    (let ((message (mq-protocol:make-mq-message
+                    :key (and (not (cffi:null-pointer-p key)) (plusp key-len)
+                              (%from-octets (%foreign-octets key key-len)))
+                    :payload (if (cffi:null-pointer-p payload) #() (%foreign-octets payload len))
+                    :headers (%read-headers rkmessage)
+                    :topic (first meta)
+                    :redelivered-p (and (gethash meta (%session-redeliver session)) t)))
+          (tag (incf (%session-next-tag session))))
+      (setf (mq-protocol:mq-message-delivery-tag message) tag
+            (gethash tag (%session-inflight session))
             (append meta (list (%partition-epoch session (first meta) (second meta))))
             (gethash meta (%session-held session)) tag)
-      (mq-protocol:make-mq-message
-       :key (and (not (cffi:null-pointer-p key)) (plusp key-len)
-                 (%from-octets (%foreign-octets key key-len)))
-       :payload (if (cffi:null-pointer-p payload) #() (%foreign-octets payload len))
-       :headers (%read-headers rkmessage)
-       :delivery-tag tag
-       :topic (first meta)
-       :redelivered-p (and (gethash meta (%session-redeliver session)) t)))))
+      message)))
 
 (defun %buffer (session topic message)
   "Keep MESSAGE, fetched for another topic, until TOPIC is polled."
@@ -525,7 +537,8 @@ assignments, and polling TOPIC resumes it."
                        (gethash topic (%session-buffered session))))
       (remhash key (%session-settled session))
       (remhash key (%session-requeued session))
-      (remhash key (%session-committed session)))))
+      (remhash key (%session-committed session))
+      (remhash key (%session-own-commits session)))))
 
 (defun %revoke-all-for-good (session)
   "Every partition this member owns or has :PENDING left it for good
@@ -562,6 +575,7 @@ Then all of KEYS are :OWNED, and the group's commit is their known commit
         (%revoke-for-good session (first key) (second key))))
     (dolist (key keys)
       (setf (gethash key ownership) :owned)
+      (remhash key (%session-own-commits session))
       (let ((entry (assoc key group :test #'equal)))
         (if entry
             (setf (gethash key known) (cdr entry))
@@ -680,7 +694,7 @@ every partition for good."
            ((%settled-p session meta) nil)
            ((not (eq (gethash key (%session-ownership session)) :owned))
             nil)
-           ((< (third meta) (gethash key (%session-committed session) -1))
+           ((< (third meta) (gethash key (%session-own-commits session) -1))
             nil)
            (t
             (%unrequeue session meta)
@@ -882,13 +896,15 @@ member?"
   "Commit TOPIC / PARTITION as far as its settled messages reach
 (%COMMIT-TARGET), if this member owns it. → the offset committed (NIL:
 none), and the error code of a commit librdkafka refused (NIL: none).
-Committed: the target is the known commit, the settled offsets below it
-are dropped. Refused because a rebalance is under way
-(REBALANCE_IN_PROGRESS, ILLEGAL_GENERATION): the offsets stay settled, and
-the next commit of the partition (an ack, or the rebalance callback) takes
-them. Refused because the group no longer knows this member
-(UNKNOWN_MEMBER_ID, FENCED_INSTANCE_ID): the assignment is lost, every
-partition is revoked for good."
+Committed: the target is the known commit and this member's own commit,
+the settled offsets below it are dropped. Refused because a rebalance is
+under way (REBALANCE_IN_PROGRESS, or ILLEGAL_GENERATION while librdkafka
+still counts the assignment): the offsets stay settled, and the next
+commit of the partition (an ack, or the rebalance callback) takes them.
+Refused because the group no longer knows this member (UNKNOWN_MEMBER_ID,
+FENCED_INSTANCE_ID, or ILLEGAL_GENERATION with the assignment lost): every
+partition is revoked for good, and the code returned is UNKNOWN_MEMBER_ID
+for an ILLEGAL_GENERATION."
   (let* ((key (list topic partition))
          (settled (gethash key (%session-settled session))))
     (when (and settled (eq (gethash key (%session-ownership session)) :owned))
@@ -897,9 +913,13 @@ partition is revoked for good."
                                     (%known-commit session key))))
         (when target
           (let ((rc (%commit session topic partition target)))
+            (when (and (= rc +rd-kafka-resp-err-illegal-generation+)
+                       (/= 0 (%rd-assignment-lost (%consumer session))))
+              (setf rc +rd-kafka-resp-err-unknown-member-id+))
             (cond
               ((zerop rc)
-               (setf (gethash key (%session-committed session)) target
+               (setf (gethash key (%session-own-commits session)) target
+                     (gethash key (%session-committed session)) target
                      (gethash key (%session-settled session))
                      (remove-if (lambda (o) (< o target)) settled))
                target)
@@ -1092,8 +1112,8 @@ of at most 200 ms, so a CLOSE on another thread waits at most one slice.
 
 (defun %release-handles (session &key abort)
   "Leave the group, flush (unless ABORT) and destroy SESSION's handles,
-once it is closed and no other call uses them. → T when there were handles
-to release."
+once it is closed and no call uses them. → T when there were handles to
+release."
   (let ((consumer (%session-consumer session))
         (producer (%session-producer session)))
     (setf (%session-producer session) nil)
@@ -1101,7 +1121,9 @@ to release."
         (when consumer
           ;; Leaves the group; the last revocation runs %ON-REBALANCE here,
           ;; and its commits use the consumer handle, still in its slot.
+          ;; From then on the callback no longer finds this session.
           (unwind-protect (%rd-consumer-close consumer)
+            (%forget-session session)
             (setf (%session-consumer session) nil))
           (%rd-destroy consumer))
       (%forget-session session)
@@ -1111,26 +1133,27 @@ to release."
     (and (or consumer producer) t)))
 
 (defun %close-session (session &key abort)
-  "Close SESSION once no call on another thread uses its handles
-(%USING-HANDLES: a poll stops at its next slice, a flush within 200 ms),
-then release them (%RELEASE-HANDLES). Called on a thread that is itself
-inside a call (from a handler of a condition the call signals), it does
-not wait for that call: the call's end releases the handles. Calls from
-then on signal MQ-CONNECTION-ERROR. → T when there were handles to
-release; NIL when there were none, or SESSION was closed already."
+  "Close SESSION once no call uses its handles (%USING-HANDLES: a poll
+stops at its next slice, a flush within 200 ms), then release them
+(%RELEASE-HANDLES). Called on a thread that is itself inside a call (from
+a handler of a condition the call signals, possibly with the session's
+locks held), it waits for nothing: the last call to end, on whichever
+thread, releases the handles. Calls from then on signal
+MQ-CONNECTION-ERROR. → T when there were handles to release; NIL when
+there were none, or SESSION was closed already."
   (let ((now
           (bt2:with-lock-held ((%session-state-lock session))
             (unless (%session-closed session)
               (setf (%session-closed session) t)
-              (let ((self (bt2:current-thread)))
-                (flet ((own () (gethash self (%session-user-threads session) 0)))
-                  (loop while (> (%session-users session) (own))
-                        do (bt2:condition-wait (%session-state-cv session)
-                                               (%session-state-lock session)))
-                  (cond
-                    ((zerop (own)) :now)
-                    (t (setf (%session-deferred-close session) (list :abort abort))
-                       :deferred))))))))
+              (cond
+                ((plusp (gethash (bt2:current-thread) (%session-user-threads session) 0))
+                 (setf (%session-deferred-close session) (list :abort abort))
+                 :deferred)
+                (t
+                 (loop while (plusp (%session-users session))
+                       do (bt2:condition-wait (%session-state-cv session)
+                                              (%session-state-lock session)))
+                 :now))))))
     (case now
       (:now (%release-handles session :abort abort))
       (:deferred (and (or (%session-consumer session) (%session-producer session)) t))
