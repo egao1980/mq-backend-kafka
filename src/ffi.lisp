@@ -120,6 +120,18 @@
 ;;; A consumer event: max.poll.interval.ms ran out, librdkafka left the group.
 (defconstant +rd-kafka-resp-err-max-poll-exceeded+ -147)
 
+;;; rd_kafka_committed failures worth one more try: the coordinator is not
+;;; known yet, moving, or loading its offsets, or the request timed out.
+(defconstant +rd-kafka-resp-err-wait-coord+ -180)
+
+(defconstant +rd-kafka-resp-err-transport+ -195)
+
+(defconstant +rd-kafka-resp-err-coordinator-load-in-progress+ 14)
+
+(defconstant +rd-kafka-resp-err-coordinator-not-available+ 15)
+
+(defconstant +rd-kafka-resp-err-not-coordinator+ 16)
+
 (cffi:defcstruct rd-kafka-topic-partition-list
   (cnt :int)
   (size :int)

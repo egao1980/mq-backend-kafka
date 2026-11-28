@@ -85,6 +85,9 @@
   ;; thread's last %LEAVE releases the handles.
   (deferred-close nil)
   (closed nil)
+  ;; T once the handles are released (%RELEASE-HANDLES ran, or had
+  ;; nothing to do): a later CLOSE waits for it.
+  (released nil)
   ;; This session's key in *SESSIONS*: the rebalance callback's opaque.
   (id nil))
 
@@ -481,16 +484,37 @@ the last one it returned."
     (loop for i below cnt
           collect (%tp-slots (cffi:mem-aptr elems '(:struct rd-kafka-topic-partition) i)))))
 
+(defparameter *committed-attempts* '(2500 2500)
+  "Timeouts (ms) of the rd_kafka_committed attempts at an assignment. It
+runs in the rebalance callback under the session lock, so acks on every
+thread wait for it: 5 s in all, not 10 s in one go. A transient failure
+(%COMMITTED-RETRY-P) is tried again; once the attempts are spent, every
+:PENDING partition leaves for good (only duplicates follow).")
+
+(defun %committed-retry-p (rc)
+  "Is an rd_kafka_committed failure RC worth another attempt?"
+  (and (member rc (list +rd-kafka-resp-err-timed-out+
+                        +rd-kafka-resp-err-wait-coord+
+                        +rd-kafka-resp-err-transport+
+                        +rd-kafka-resp-err-coordinator-load-in-progress+
+                        +rd-kafka-resp-err-coordinator-not-available+
+                        +rd-kafka-resp-err-not-coordinator+))
+       t))
+
 (defun %group-committed (rk keys)
   "The group's committed offsets of KEYS ((topic partition) ...), asked of
-the coordinator: an alist key → offset (RD_KAFKA_OFFSET_INVALID: none). A
-partition the coordinator did not answer for is left out."
+the coordinator (*COMMITTED-ATTEMPTS*): an alist key → offset
+(RD_KAFKA_OFFSET_INVALID: none). A partition the coordinator did not
+answer for is left out."
   (let ((list (%rd-tpl-new (length keys))))
     (unwind-protect
         (progn
           (loop for (topic partition) in keys
                 do (%rd-tpl-add list topic partition))
-          (when (zerop (%rd-committed rk list 10000))
+          (when (loop for (timeout . more) on *committed-attempts*
+                      for rc = (%rd-committed rk list timeout)
+                      when (zerop rc) return t
+                      unless (and more (%committed-retry-p rc)) return nil)
             (loop for (topic partition offset err) in (%partition-list list)
                   when (zerop err)
                     collect (cons (list topic partition) offset))))
@@ -892,6 +916,12 @@ member?"
   (or (= rc +rd-kafka-resp-err-rebalance-in-progress+)
       (= rc +rd-kafka-resp-err-illegal-generation+)))
 
+(defun %consumer-protocol-p (session)
+  "Does SESSION's CONFIG choose the KIP-848 consumer group protocol
+(group.protocol=consumer; librdkafka's default is classic)?"
+  (let ((entry (assoc "group.protocol" (%session-config session) :test #'string-equal)))
+    (and entry (string-equal "consumer" (string-trim " " (cdr entry))) t)))
+
 (defun %commit-settled (session topic partition)
   "Commit TOPIC / PARTITION as far as its settled messages reach
 (%COMMIT-TARGET), if this member owns it. → the offset committed (NIL:
@@ -904,7 +934,11 @@ commit of the partition (an ack, or the rebalance callback) takes them.
 Refused because the group no longer knows this member (UNKNOWN_MEMBER_ID,
 FENCED_INSTANCE_ID, or ILLEGAL_GENERATION with the assignment lost): every
 partition is revoked for good, and the code returned is UNKNOWN_MEMBER_ID
-for an ILLEGAL_GENERATION."
+for an ILLEGAL_GENERATION. Under the consumer group protocol (KIP-848,
+group.protocol=consumer) librdkafka answers UNKNOWN_MEMBER_ID with a
+heartbeat and keeps the assignment, and a real loss comes as a lost
+revocation: there it is a rebalance refusal, returned as
+REBALANCE_IN_PROGRESS."
   (let* ((key (list topic partition))
          (settled (gethash key (%session-settled session))))
     (when (and settled (eq (gethash key (%session-ownership session)) :owned))
@@ -913,9 +947,13 @@ for an ILLEGAL_GENERATION."
                                     (%known-commit session key))))
         (when target
           (let ((rc (%commit session topic partition target)))
-            (when (and (= rc +rd-kafka-resp-err-illegal-generation+)
-                       (/= 0 (%rd-assignment-lost (%consumer session))))
-              (setf rc +rd-kafka-resp-err-unknown-member-id+))
+            (cond
+              ((and (= rc +rd-kafka-resp-err-unknown-member-id+)
+                    (%consumer-protocol-p session))
+               (setf rc +rd-kafka-resp-err-rebalance-in-progress+))
+              ((and (= rc +rd-kafka-resp-err-illegal-generation+)
+                    (/= 0 (%rd-assignment-lost (%consumer session))))
+               (setf rc +rd-kafka-resp-err-unknown-member-id+)))
             (cond
               ((zerop rc)
                (setf (gethash key (%session-own-commits session)) target
@@ -1112,24 +1150,28 @@ of at most 200 ms, so a CLOSE on another thread waits at most one slice.
 
 (defun %release-handles (session &key abort)
   "Leave the group, flush (unless ABORT) and destroy SESSION's handles,
-once it is closed and no call uses them. → T when there were handles to
-release."
+once it is closed and no call uses them; then mark SESSION released, which
+a later CLOSE waits for. → T when there were handles to release."
   (let ((consumer (%session-consumer session))
         (producer (%session-producer session)))
     (setf (%session-producer session) nil)
     (unwind-protect
-        (when consumer
-          ;; Leaves the group; the last revocation runs %ON-REBALANCE here,
-          ;; and its commits use the consumer handle, still in its slot.
-          ;; From then on the callback no longer finds this session.
-          (unwind-protect (%rd-consumer-close consumer)
-            (%forget-session session)
-            (setf (%session-consumer session) nil))
-          (%rd-destroy consumer))
-      (%forget-session session)
-      (when producer
-        (unless abort (%rd-flush producer 10000))
-        (%rd-destroy producer)))
+        (unwind-protect
+            (when consumer
+              ;; Leaves the group; the last revocation runs %ON-REBALANCE here,
+              ;; and its commits use the consumer handle, still in its slot.
+              ;; From then on the callback no longer finds this session.
+              (unwind-protect (%rd-consumer-close consumer)
+                (%forget-session session)
+                (setf (%session-consumer session) nil))
+              (%rd-destroy consumer))
+          (%forget-session session)
+          (when producer
+            (unless abort (%rd-flush producer 10000))
+            (%rd-destroy producer)))
+      (bt2:with-lock-held ((%session-state-lock session))
+        (setf (%session-released session) t)
+        (bt2:condition-broadcast (%session-state-cv session))))
     (and (or consumer producer) t)))
 
 (defun %close-session (session &key abort)
@@ -1139,17 +1181,27 @@ stops at its next slice, a flush within 200 ms), then release them
 a handler of a condition the call signals, possibly with the session's
 locks held), it waits for nothing: the last call to end, on whichever
 thread, releases the handles. Calls from then on signal
-MQ-CONNECTION-ERROR. → T when there were handles to release; NIL when
-there were none, or SESSION was closed already."
+MQ-CONNECTION-ERROR. A CLOSE of a SESSION closed already waits until the
+first one has released the handles (unless its thread is inside a call,
+which that release waits for). → T when there were handles to release;
+NIL when there were none, or SESSION was closed already."
   (let ((now
           (bt2:with-lock-held ((%session-state-lock session))
-            (unless (%session-closed session)
-              (setf (%session-closed session) t)
+            (let ((inside (plusp (gethash (bt2:current-thread)
+                                          (%session-user-threads session) 0))))
               (cond
-                ((plusp (gethash (bt2:current-thread) (%session-user-threads session) 0))
-                 (setf (%session-deferred-close session) (list :abort abort))
+                ((%session-closed session)
+                 (unless inside
+                   (loop until (%session-released session)
+                         do (bt2:condition-wait (%session-state-cv session)
+                                                (%session-state-lock session))))
+                 nil)
+                (inside
+                 (setf (%session-closed session) t
+                       (%session-deferred-close session) (list :abort abort))
                  :deferred)
                 (t
+                 (setf (%session-closed session) t)
                  (loop while (plusp (%session-users session))
                        do (bt2:condition-wait (%session-state-cv session)
                                               (%session-state-lock session)))
